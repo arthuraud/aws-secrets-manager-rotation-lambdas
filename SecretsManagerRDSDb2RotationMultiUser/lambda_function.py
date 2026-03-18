@@ -1,10 +1,13 @@
 # Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
+import time
 
 import boto3
 import json
 import logging
 import os
+import re
+import traceback
 import ibm_db
 
 logger = logging.getLogger()
@@ -49,9 +52,9 @@ def lambda_handler(event, context):
         KeyError: If the secret json does not contain the expected keys
 
     """
-    arn = event['SecretId']
-    token = event['ClientRequestToken']
-    step = event['Step']
+    arn = get_input_map_value(event, 'SecretId')
+    token = get_input_map_value(event, 'ClientRequestToken')
+    step = get_input_map_value(event, 'Step')
 
     # Setup the client
     service_client = boto3.client('secretsmanager', endpoint_url=os.environ['SECRETS_MANAGER_ENDPOINT'])
@@ -80,6 +83,9 @@ def lambda_handler(event, context):
         set_secret(service_client, arn, token)
 
     elif step == "testSecret":
+        # Wait for 10s to allow propagation of the newly set AWSPENDING password as the user password in the database.
+        # The database user password change is asynchronous.
+        time.sleep(10)
         test_secret(service_client, arn, token)
 
     elif step == "finishSecret":
@@ -214,8 +220,8 @@ def set_secret(service_client, arn, token):
         if not "Username %s already exists" % pending_dict['username'] in str(e):
             ibm_db.close(admin_conn)
             ibm_db.close(db_conn)
-            logger.error("setSecret: Unable to create user %s" % pending_dict['username'])
-            raise ValueError("Unable to create user %s" % pending_dict['username'])
+            logger.error("setSecret: Unable to create user %s due to %s" % (pending_dict['username'], traceback.format_exc()))
+            raise ValueError("Unable to create user %s" % pending_dict['username']) from e
 
     # Copy permissions
     perm_to_cmd_map = {
@@ -233,9 +239,22 @@ def set_secret(service_client, arn, token):
         pending_username = None
         list_stmt = "call rdsadmin.list_users()"
         list_resp = ibm_db.exec_immediate(admin_conn, list_stmt)
-        user_list = ibm_db.fetch_assoc(list_resp)['1'].split("\n")
-        # Loop through the user list. First 3 rows are headers and last 3 are footers for the list_users procedure
-        for user_index in range(3, len(user_list) - 3):
+        user_list_raw = ibm_db.fetch_assoc(list_resp)
+
+        # The rdsadmin.list_users() call is a stored proc for RDS Db2
+        # The output is given as a dictionary.
+        # Originally, the stored proc field was '1', but now is 'TASK_OUTPUT'
+        # Both should be supported for this rotation lambda
+        new_key = 'TASK_OUTPUT'
+        old_key = '1'
+
+        if ((users_str := user_list_raw.get(new_key)) == None) and ((users_str := user_list_raw.get(old_key)) == None):
+            logger.error("Unknown rdsadmin.list_users() output format.")
+            raise ValueError("Unknown rdsadmin.list_users() output format.")
+
+        user_list = users_str.split("\n")
+        # Loop through the user list. First 2 rows are headers and last 3 are footers for the list_users procedure
+        for user_index in range(2, len(user_list) - 3):
             if user_list[user_index].upper().startswith("%s\t" % pending_dict['username'].upper()):
                 pending_username = pending_dict['username'].upper()
                 break
@@ -636,7 +655,7 @@ def get_random_password(service_client):
         string: The randomly generated password.
     """
     passwd = service_client.get_random_password(
-        ExcludeCharacters=os.environ.get('EXCLUDE_CHARACTERS', '/@"\'\\;'),
+        ExcludeCharacters=os.environ.get('EXCLUDE_CHARACTERS', '/@"\'\\;,*!-?&|[]{}^()'),
         PasswordLength=int(os.environ.get('PASSWORD_LENGTH', 32)),
         ExcludeNumbers=get_environment_bool('EXCLUDE_NUMBERS', False),
         ExcludePunctuation=get_environment_bool('EXCLUDE_PUNCTUATION', False),
@@ -645,3 +664,28 @@ def get_random_password(service_client):
         RequireEachIncludedType=get_environment_bool('REQUIRE_EACH_INCLUDED_TYPE', True)
     )
     return passwd['RandomPassword']
+
+
+def get_input_map_value(input_dict, field_name):
+    """Gets a value from a dictionary provided as an input to the lambda function.
+    This function will raise an exception if the field is not found, or if the value contains an invalid character
+
+    Args:
+        input_dict (dictionary): The raw input dictionary passed to the lambda
+
+        field_name (string): The name of the field to pull from the input dictionary (key)
+
+    Returns:
+        string: Value from the user input with regex filtering
+
+    Raises:
+        ValueError: If the field is not found, or the value contains an invalid character
+
+    """
+    if field_name in input_dict:
+        raw_value = input_dict[field_name]
+        if re.match(r'^[ -~]+$', raw_value) is not None:
+            return raw_value
+        else:
+            raise ValueError("\"%s\" contains invalid characters. Only printable ASCII characters are allowed." % field_name)
+    raise ValueError("No value provided for \"%s\"." % field_name)

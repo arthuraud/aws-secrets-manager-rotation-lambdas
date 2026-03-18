@@ -51,9 +51,9 @@ def lambda_handler(event, context):
         KeyError: If the secret json does not contain the expected keys
 
     """
-    arn = event['SecretId']
-    token = event['ClientRequestToken']
-    step = event['Step']
+    arn = get_input_map_value(event, 'SecretId')
+    token = get_input_map_value(event, 'ClientRequestToken')
+    step = get_input_map_value(event, 'Step')
 
     # Setup the client
     service_client = boto3.client('secretsmanager', endpoint_url=os.environ['SECRETS_MANAGER_ENDPOINT'])
@@ -760,3 +760,28 @@ def get_random_password(service_client):
         RequireEachIncludedType=get_environment_bool('REQUIRE_EACH_INCLUDED_TYPE', True)
     )
     return passwd['RandomPassword']
+
+
+def get_input_map_value(input_dict, field_name):
+    """Gets a value from a dictionary provided as an input to the lambda function.
+    This function will raise an exception if the field is not found, or if the value contains an invalid character
+
+    Args:
+        input_dict (dictionary): The raw input dictionary passed to the lambda
+
+        field_name (string): The name of the field to pull from the input dictionary (key)
+
+    Returns:
+        string: Value from the user input with regex filtering
+
+    Raises:
+        ValueError: If the field is not found, or the value contains an invalid character
+
+    """
+    if field_name in input_dict:
+        raw_value = input_dict[field_name]
+        if re.match(r'^[ -~]+$', raw_value) is not None:
+            return raw_value
+        else:
+            raise ValueError("\"%s\" contains invalid characters. Only printable ASCII characters are allowed." % field_name)
+    raise ValueError("No value provided for \"%s\"." % field_name)
