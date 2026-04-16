@@ -5,8 +5,7 @@ import boto3
 import json
 import logging
 import os
-import pg
-import pgdb
+import redshift_connector
 import re
 
 logger = logging.getLogger()
@@ -70,6 +69,7 @@ def lambda_handler(event, context):
         raise ValueError("Secret version %s not set as AWSPENDING for rotation of secret %s." % (token, arn))
 
     # Call the appropriate step
+    logger.info("Secret rotation step %s for secret %s", step, arn)
     if step == "createSecret":
         create_secret(service_client, arn, token)
 
@@ -190,13 +190,19 @@ def set_secret(service_client, arn, token):
     # Now set the password to the pending password
     try:
         with conn.cursor() as cur:
-            # Get escaped username via quote_ident
-            cur.execute("SELECT quote_ident(%s)", (pending_dict['username'],))
-            escaped_username = cur.fetchone()[0]
+            # Get identifier for the username via QUOTE_IDENT
+            cur.execute("SELECT QUOTE_IDENT(%s)", (pending_dict['username'],))
+            username_ident = cur.fetchone()[0]
 
-            alter_role = "ALTER USER %s" % escaped_username
-            cur.execute(alter_role + " WITH PASSWORD %s", (pending_dict['password'],))
+            # Get the password as a string literal with proper escaping using QUOTE_LITERAL
+            cur.execute("SELECT QUOTE_LITERAL(%s)", (pending_dict['password'],))
+            password_literal = cur.fetchone()[0]
+
+            # Set the user password
+            # We cannot used a parameterized query as Redshift only supports prepared queries for SELECT/INSERT/UPDATE/DELETE
+            cur.execute("ALTER USER %s WITH PASSWORD %s" % (username_ident, password_literal))
             conn.commit()
+
             logger.info("setSecret: Successfully set password for user %s in Redshift DB for secret arn %s." % (pending_dict['username'], arn))
     finally:
         conn.close()
@@ -282,7 +288,7 @@ def get_connection(secret_dict):
         secret_dict (dict): The Secret Dictionary
 
     Returns:
-        Connection: The pgdb.Connection object if successful. None otherwise
+        Connection: The redshift_connector.Connection object if successful. None otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -292,12 +298,14 @@ def get_connection(secret_dict):
     port = int(secret_dict['port']) if 'port' in secret_dict else 5439
     dbname = secret_dict['dbname'] if 'dbname' in secret_dict else "dev"
 
+    username = secret_dict['username']
+    host = secret_dict['host']
     # Try to obtain a connection to the db
     try:
-        conn = pgdb.connect(host=secret_dict['host'], user=secret_dict['username'], password=secret_dict['password'], database=dbname, port=port, connect_timeout=5)
-        logger.info("Successfully established connection as user '%s' with host: '%s'" % (secret_dict['username'], secret_dict['host']))
+        conn = redshift_connector.connect(host=host, user=username, password=secret_dict['password'], database=dbname, port=port, timeout=5)
+        logger.info("Successfully established connection as user '%s' with host: '%s'" % (username, host))
         return conn
-    except pg.InternalError:
+    except (redshift_connector.InternalError, redshift_connector.InterfaceError):
         return None
 
 

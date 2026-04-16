@@ -248,7 +248,7 @@ def set_secret(service_client, arn, token):
         new_key = 'TASK_OUTPUT'
         old_key = '1'
 
-        if ((users_str := user_list_raw.get(new_key)) == None) and ((users_str := user_list_raw.get(old_key)) == None):
+        if ((users_str := user_list_raw.get(new_key)) is None) and ((users_str := user_list_raw.get(old_key)) is None):
             logger.error("Unknown rdsadmin.list_users() output format.")
             raise ValueError("Unknown rdsadmin.list_users() output format.")
 

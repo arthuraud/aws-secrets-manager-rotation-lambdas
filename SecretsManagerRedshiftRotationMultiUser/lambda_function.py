@@ -5,8 +5,7 @@ import boto3
 import json
 import logging
 import os
-import pg
-import pgdb
+import redshift_connector
 import re
 
 logger = logging.getLogger()
@@ -75,6 +74,7 @@ def lambda_handler(event, context):
         raise ValueError("Secret version %s not set as AWSPENDING for rotation of secret %s." % (token, arn))
 
     # Call the appropriate step
+    logger.info("Secret rotation step %s for secret %s", step, arn)
     if step == "createSecret":
         create_secret(service_client, arn, token)
 
@@ -200,49 +200,53 @@ def set_secret(service_client, arn, token):
     # Now set the password to the pending password
     try:
         with conn.cursor() as cur:
-            # Get escaped usernames via quote_ident
-            cur.execute("SELECT quote_ident(%s)", (pending_dict['username'],))
-            pending_username = cur.fetchone()[0]
+            # Use QUOTE_LITERAL to escape string parameters with SQL injection protection
+            # This is required because Redshift only allows prepared parameterized queries
+            # for SELECT/INSERT/UPDATE/DELETE
+            pending_password_literal = get_quote_literal(cur, pending_dict['password'])
+
+            # Get username identifier via QUOTE_IDENT
+            cur.execute("SELECT QUOTE_IDENT(%s)", (pending_dict['username'],))
+            pending_username_ident = cur.fetchone()[0]
 
             # Check if the user exists, if not create it and grant it all permissions from the current role
             # If the user exists, just update the password
             cur.execute("SELECT usename FROM pg_user where usename = %s", (pending_dict['username'],))
             if len(cur.fetchall()) == 0:
-                create_role = "CREATE USER %s" % pending_username
-                cur.execute(create_role + " WITH PASSWORD %s", (pending_dict['password'],))
+                logger.info("Creating new user: %s based on user %s" % (pending_dict['username'], current_dict['username']))
+                cur.execute("CREATE USER %s WITH PASSWORD %s" % (pending_username_ident, pending_password_literal))
 
                 # Grant the database permissions
                 db_perm_types = ['CREATE', 'TEMPORARY', 'TEMP']
                 for perm in db_perm_types:
-                    cur.execute("SELECT QUOTE_IDENT(dat.datname) as datname FROM pg_database dat WHERE HAS_DATABASE_PRIVILEGE(%s, dat.datname , %s)",
+                    cur.execute("SELECT QUOTE_IDENT(dat.datname) AS datname FROM pg_database dat WHERE HAS_DATABASE_PRIVILEGE(%s, dat.datname, %s)",
                                 (current_dict['username'], perm))
-                    databases = [row.datname for row in cur.fetchall()]
+                    databases = [row[0] for row in cur.fetchall()]
                     if databases:
                         for database in databases:
-                            cur.execute("GRANT %s ON DATABASE %s TO %s" % (perm, database, pending_username))
+                            cur.execute("GRANT %s ON DATABASE %s TO %s" % (perm, database, pending_username_ident))
 
                 # Grant table permissions
                 table_perm_types = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'REFERENCES']
                 for perm in table_perm_types:
-                    cur.execute("SELECT QUOTE_IDENT(tab.schemaname) as schemaname, QUOTE_IDENT(tab.tablename) as tablename FROM pg_tables tab WHERE "
+                    cur.execute("SELECT QUOTE_IDENT(tab.schemaname) AS schemaname, QUOTE_IDENT(tab.tablename) AS tablename FROM pg_tables tab WHERE "
                                 "HAS_TABLE_PRIVILEGE(%s, QUOTE_IDENT(tab.schemaname) + '.' + QUOTE_IDENT(tab.tablename) , %s) AND tab.schemaname NOT IN ('pg_internal','pg_automv')",
                                 (current_dict['username'], perm))
-                    tables = [row.schemaname + '.' + row.tablename for row in cur.fetchall()]
+                    tables = [row[0] + '.' + row[1] for row in cur.fetchall()]
                     if tables:
-                        cur.execute("GRANT %s ON TABLE %s TO %s" % (perm, ','.join(tables), pending_username))
+                        cur.execute("GRANT %s ON TABLE %s TO %s" % (perm, ','.join(tables), pending_username_ident))
 
                 # Grant schema permissions
                 table_perm_types = ['CREATE', 'USAGE']
                 for perm in table_perm_types:
                     cur.execute(
-                        "SELECT QUOTE_IDENT(schemaname) as schemaname FROM (SELECT DISTINCT schemaname FROM pg_tables) WHERE HAS_SCHEMA_PRIVILEGE(%s, schemaname, %s)",
+                        "SELECT QUOTE_IDENT(schemaname) AS schemaname FROM (SELECT DISTINCT schemaname FROM pg_tables) WHERE HAS_SCHEMA_PRIVILEGE(%s, schemaname, %s)",
                         (current_dict['username'], perm))
-                    schemas = [row.schemaname for row in cur.fetchall()]
+                    schemas = [row[0] for row in cur.fetchall()]
                     if schemas:
-                        cur.execute("GRANT %s ON SCHEMA %s TO %s" % (perm, ','.join(schemas), pending_username))
+                        cur.execute("GRANT %s ON SCHEMA %s TO %s" % (perm, ','.join(schemas), pending_username_ident))
             else:
-                alter_role = "ALTER USER %s" % pending_username
-                cur.execute(alter_role + " WITH PASSWORD %s", (pending_dict['password'],))
+                cur.execute("ALTER USER %s WITH PASSWORD %s" % (pending_username_ident, pending_password_literal))
 
             conn.commit()
             logger.info("setSecret: Successfully set password for %s in Redshift DB for secret arn %s." % (pending_dict['username'], arn))
@@ -333,7 +337,7 @@ def get_connection(secret_dict):
         secret_dict (dict): The Secret Dictionary
 
     Returns:
-        Connection: The pgdb.Connection object if successful. None otherwise
+        Connection: The redshift_connector.Connection object if successful. None otherwise
 
     Raises:
         KeyError: If the secret json does not contain the expected keys
@@ -343,13 +347,14 @@ def get_connection(secret_dict):
     port = int(secret_dict['port']) if 'port' in secret_dict else 5439
     dbname = secret_dict['dbname'] if secret_dict.get('dbname') is not None else "dev"
 
+    username = secret_dict['username']
+    host = secret_dict['host']
     # Try to obtain a connection to the db
     try:
-        conn = pgdb.connect(host=secret_dict['host'], user=secret_dict['username'], password=secret_dict['password'], database=dbname, port=port,
-                            connect_timeout=5)
-        logger.info("Successfully established connection as user '%s' with host: '%s'" % (secret_dict['username'], secret_dict['host']))
+        conn = redshift_connector.connect(host=host, user=username, password=secret_dict['password'], database=dbname, port=port, timeout=5)
+        logger.info("Successfully established connection as user '%s' with host: '%s'" % (username, host))
         return conn
-    except pg.InternalError:
+    except (redshift_connector.InternalError, redshift_connector.InterfaceError):
         return None
 
 
@@ -692,3 +697,17 @@ def get_input_map_value(input_dict, field_name):
         else:
             raise ValueError("\"%s\" contains invalid characters. Only printable ASCII characters are allowed." % field_name)
     raise ValueError("No value provided for \"%s\"." % field_name)
+
+
+def get_quote_literal(cur, param):
+    """
+    Escape a parameter to prevent SQL injection using QUOTE_LITERAL
+    Args:
+        cur (cursor): The database cursor
+        param (string): The parameter to be escaped
+
+    Returns:
+        string: The parameter ready to be used as a string literal
+    """
+    cur.execute("SELECT QUOTE_LITERAL(%s)", (param,))
+    return cur.fetchone()[0]
